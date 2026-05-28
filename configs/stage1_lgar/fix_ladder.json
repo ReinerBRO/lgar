@@ -1,0 +1,30 @@
+{
+  "stage1_policy": "Run no more than one hard-LGAR fix without writing a review note; if Stage1 fails, try at least five bounded optimization rounds only when a mechanism signal exists.",
+  "rounds": [
+    {
+      "round": 1,
+      "change": "Tighten label quality: lsd_top_fraction=0.05 and long_nll_max_quantile=0.60.",
+      "stop_if": "positive labels vanish or router precision does not beat random."
+    },
+    {
+      "round": 2,
+      "change": "Reduce routing harm: local_window=2048 and final_global_budget=0.50.",
+      "stop_if": "normal CE exceeds CE-CPT by more than 0.02 after routing begins."
+    },
+    {
+      "round": 3,
+      "change": "Route fewer layers: routed_layer_fraction=0.25.",
+      "stop_if": "actual budget or routed-token LSD separation disappears."
+    },
+    {
+      "round": 4,
+      "change": "Stabilize auxiliary pressure: lambda_router=0.01 and lambda_budget=0.005.",
+      "stop_if": "router AUC remains <=0.55 and precision@budget remains random."
+    },
+    {
+      "round": 5,
+      "change": "Keep 75%-100% global budget longer before dropping to 50%.",
+      "stop_if": "no high-LSD CE, Long4096 CE, RULER-mini, or NoLiMa-style gain appears."
+    }
+  ]
+}
