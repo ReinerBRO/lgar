@@ -8,10 +8,16 @@ build/
 .venv/
 venv/
 .env
+.DS_Store
 *.npy
 *.pt
 *.bin
 *.safetensors
+*.tar.gz
+*.zip
 data/
 runs/
 logs/
+reports/
+packages/
+tianyi_sync_test.txt

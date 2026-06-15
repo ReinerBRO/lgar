@@ -460,21 +460,46 @@ def eval_long_dependency(
     return metrics
 
 
+def _load_first_existing_dataset(paths: list[Path]) -> Dataset | None:
+    for path in paths:
+        if not path.exists():
+            continue
+        if path.suffix == ".arrow":
+            return Dataset.from_file(str(path))
+        if path.suffix == ".parquet":
+            return Dataset.from_parquet(str(path))
+    return None
+
+
 def _mc_cases_from_arrow(root: Path, limit: int) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    hs = Dataset.from_file(str(root / "hellaswag" / "hellaswag-validation.arrow"))
-    for row in hs.select(range(min(limit, len(hs)))):
-        cases.append({"prompt": row["ctx"], "target": row["endings"][int(row["label"])], "choices": row["endings"], "task": "hellaswag"})
-    piqa = Dataset.from_file(str(root / "piqa" / "piqa-validation.arrow"))
-    for row in piqa.select(range(min(limit, len(piqa)))):
-        choices = [row["sol1"], row["sol2"]]
-        cases.append({"prompt": row["goal"] + "\nAnswer:", "target": choices[int(row["label"])], "choices": choices, "task": "piqa"})
-    arc = Dataset.from_file(str(root / "arc_easy" / "ai2_arc-validation.arrow"))
-    for row in arc.select(range(min(limit, len(arc)))):
-        labels = row["choices"]["label"]
-        texts = row["choices"]["text"]
-        idx = labels.index(row["answerKey"])
-        cases.append({"prompt": row["question"] + "\nAnswer:", "target": texts[idx], "choices": texts, "task": "arc_easy"})
+    hs = _load_first_existing_dataset([
+        root / "hellaswag" / "hellaswag-validation.arrow",
+        root / "hellaswag" / "data" / "validation-00000-of-00001.parquet",
+    ])
+    if hs is not None:
+        for row in hs.select(range(min(limit, len(hs)))):
+            cases.append({"prompt": row["ctx"], "target": row["endings"][int(row["label"])], "choices": row["endings"], "task": "hellaswag"})
+
+    piqa = _load_first_existing_dataset([
+        root / "piqa" / "piqa-validation.arrow",
+        root / "piqa" / "data" / "validation-00000-of-00001.parquet",
+    ])
+    if piqa is not None:
+        for row in piqa.select(range(min(limit, len(piqa)))):
+            choices = [row["sol1"], row["sol2"]]
+            cases.append({"prompt": row["goal"] + "\nAnswer:", "target": choices[int(row["label"])], "choices": choices, "task": "piqa"})
+
+    arc = _load_first_existing_dataset([
+        root / "arc_easy" / "ai2_arc-validation.arrow",
+        root / "arc_easy" / "ARC-Easy" / "validation-00000-of-00001.parquet",
+    ])
+    if arc is not None:
+        for row in arc.select(range(min(limit, len(arc)))):
+            labels = row["choices"]["label"]
+            texts = row["choices"]["text"]
+            idx = labels.index(row["answerKey"])
+            cases.append({"prompt": row["question"] + "\nAnswer:", "target": texts[idx], "choices": texts, "task": "arc_easy"})
     return cases
 
 

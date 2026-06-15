@@ -63,6 +63,8 @@ def _load_py_module(path: Path, module_name: str) -> Any:
 def _load_official_task_configs(ruler_dir: Path) -> dict[str, dict[str, Any]]:
     yaml_path = ruler_dir / "scripts" / "synthetic.yaml"
     constants_path = ruler_dir / "_assets" / "RULER" / "scripts" / "data" / "synthetic" / "constants.py"
+    if not constants_path.exists():
+        constants_path = ruler_dir / "scripts" / "data" / "synthetic" / "constants.py"
     tasks_yaml = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     tasks_base = _load_py_module(constants_path, "ruler13_synthetic_constants").TASKS
     merged: dict[str, dict[str, Any]] = {}
@@ -91,7 +93,10 @@ def _merge_lgar_params(ckpt_params: dict[str, Any], args: argparse.Namespace) ->
     return LGARParams(**values)
 
 
-def _load_model_bundle(args: argparse.Namespace, device: torch.device) -> tuple[torch.nn.Module, Any, LGARParams, SharedQueryRouter | None]:
+def _load_model_bundle(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[torch.nn.Module, Any, LGARParams, SharedQueryRouter | None, set[tuple[int, int]]]:
     tokenizer = load_tokenizer(args.model_path)
     checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
     ckpt_params = checkpoint.get("extra", {}).get("lgar_params", {})
@@ -105,6 +110,26 @@ def _load_model_bundle(args: argparse.Namespace, device: torch.device) -> tuple[
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     model.eval()
+    if checkpoint.get("adapters"):
+        from curcpt.forward import _register_adapter_hooks
+        from curcpt.model_eval_utils import load_adapters_from_checkpoint
+
+        adapters = load_adapters_from_checkpoint(checkpoint, model, device)
+        model._curcpt_adapters = adapters  # keep modules alive for generation hooks
+        model._curcpt_adapter_handles = _register_adapter_hooks(model, adapters)
+
+    retrieval_heads: set[tuple[int, int]] = set()
+    if args.mode == "rh_bottleneck":
+        from curcpt.rh_bottleneck import resolve_retrieval_heads
+
+        retrieval_heads = resolve_retrieval_heads(
+            checkpoint,
+            explicit_heads=args.retrieval_heads,
+            heads_json=args.retrieval_heads_json,
+            reference_checkpoint_path=args.reference_checkpoint_path,
+        )
+        if not retrieval_heads:
+            raise SystemExit("rh_bottleneck evaluation requires retrieval heads")
 
     router: SharedQueryRouter | None = None
     if args.mode in {"router_aux", "routed"}:
@@ -115,7 +140,7 @@ def _load_model_bundle(args: argparse.Namespace, device: torch.device) -> tuple[
         router.load_state_dict(router_state, strict=True)
         router.to(device)
         router.eval()
-    return model, tokenizer, lgar_params, router
+    return model, tokenizer, lgar_params, router, retrieval_heads
 
 
 def _slice_prompt_ids(tokenizer: Any, prompt: str, seq_len: int) -> list[int]:
@@ -303,10 +328,13 @@ def main() -> None:
     parser.add_argument("--subset", default="validation")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--mode", choices=["full", "router_aux", "routed"], default="full")
+    parser.add_argument("--mode", choices=["full", "router_aux", "routed", "rh_bottleneck", "rh_layer_bottleneck"], default="full")
     parser.add_argument("--target-budget", type=float, default=None)
     parser.add_argument("--force-last-query-global", action="store_true")
     parser.add_argument("--append-answer-prefix", action="store_true")
+    parser.add_argument("--retrieval-heads", default=None, help="Comma-separated L:H heads for rh_bottleneck eval.")
+    parser.add_argument("--retrieval-heads-json", default=None, help="Ablation JSON containing retrieval_heads.")
+    parser.add_argument("--reference-checkpoint-path", default=None, help="Checkpoint to read retrieval heads from when this checkpoint has none.")
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--seq-len", type=int, default=None)
@@ -328,12 +356,27 @@ def main() -> None:
         if task not in task_configs:
             raise SystemExit(f"unknown RULER task: {task}")
 
-    model, tokenizer, lgar_params, router = _load_model_bundle(args, device)
+    model, tokenizer, lgar_params, router, retrieval_heads = _load_model_bundle(args, device)
     seq_len = int(lgar_params.seq_len if args.seq_len is None else args.seq_len)
 
     if args.mode == "full":
         def generator(prompts: list[str], seq_len: int, max_new_tokens: int) -> list[str]:
             return _generate_full(model, tokenizer, prompts, seq_len, max_new_tokens, device)
+    elif args.mode in {"rh_bottleneck", "rh_layer_bottleneck"}:
+        from curcpt.rh_bottleneck import greedy_generate
+
+        def generator(prompts: list[str], seq_len: int, max_new_tokens: int) -> list[str]:
+            return greedy_generate(
+                model,
+                tokenizer,
+                prompts,
+                seq_len,
+                max_new_tokens,
+                device,
+                eval_mode=args.mode,
+                retrieval_heads=retrieval_heads,
+                local_window=int(lgar_params.local_window),
+            )
     else:
         if router is None:
             raise SystemExit("routed generation requires router weights")
@@ -378,6 +421,7 @@ def main() -> None:
         "local_rank": local_rank,
         "device": str(device),
         "mode": args.mode,
+        "rh_bottleneck_retrieval_heads": sorted([list(head) for head in retrieval_heads]),
         "checkpoint_path": args.checkpoint_path,
         "data_dir": str(data_dir),
         "save_dir": str(save_dir),

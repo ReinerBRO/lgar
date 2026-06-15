@@ -1,0 +1,29 @@
+# Tianyi Cloud Desktop upload ignore rules
+# One pattern per line. Directory patterns should end with /.
+.git/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+data/
+logs/
+outputs/
+output/
+runs/
+tmp/
+.cache/
+wandb/

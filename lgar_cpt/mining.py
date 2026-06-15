@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,14 +27,29 @@ def gather_logprob(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 def ce_from_logits(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    losses = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)).float(),
-        labels.reshape(-1),
-        reduction="none",
-    ).view_as(labels)
-    if mask.any():
-        return losses[mask].mean()
-    return losses.mean()
+    chunk_size = max(1, int(os.environ.get("LGAR_CE_CHUNK_SIZE", "512")))
+    vocab_size = logits.size(-1)
+    labels = labels.contiguous()
+    mask = mask.bool().contiguous()
+
+    use_mask = bool(mask.any().item())
+    total = logits.new_zeros((), dtype=torch.float32)
+    count = 0
+    for start in range(0, labels.shape[1], chunk_size):
+        end = min(start + chunk_size, labels.shape[1])
+        losses = F.cross_entropy(
+            logits[:, start:end].reshape(-1, vocab_size).float(),
+            labels[:, start:end].reshape(-1),
+            reduction="none",
+        ).view(labels.shape[0], end - start)
+        if use_mask:
+            mask_chunk = mask[:, start:end]
+            total = total + losses[mask_chunk].sum()
+            count += int(mask_chunk.sum().item())
+        else:
+            total = total + losses.sum()
+            count += losses.numel()
+    return total / max(1, count)
 
 
 def _additive_mask(allowed: torch.Tensor) -> torch.Tensor:
