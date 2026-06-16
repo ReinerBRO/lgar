@@ -52,6 +52,15 @@ from .losses import (
     cure_rh_loss,
     select_cure_main_loss_mask,
 )
+from .sae import (
+    EvidenceFeatureSet,
+    SparseAutoencoder,
+    load_evidence_feature_set,
+    load_sparse_autoencoder,
+    lsor_loss,
+    sae_feature_losses,
+    short_kl_loss,
+)
 
 
 def _distributed_context() -> tuple[int, int, int, torch.device]:
@@ -75,6 +84,23 @@ def _is_rank0(rank: int) -> bool:
 def _barrier() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+
+def _validate_sae_layer_covers_retrieval_heads(
+    sae_layer: int,
+    retrieval_heads: set[tuple[int, int]],
+) -> None:
+    if not retrieval_heads:
+        raise ValueError("SAE-CURE requires non-empty selected retrieval heads")
+    selected_layers = {int(layer) for layer, _head in retrieval_heads}
+    max_selected_layer = max(selected_layers)
+    if int(sae_layer) < max_selected_layer:
+        raise ValueError(
+            "SAE layer must be at or after every selected retrieval-head layer "
+            f"so SAE loss has a gradient path to all selected heads; "
+            f"sae_layer={int(sae_layer)} max_selected_head_layer={max_selected_layer}. "
+            "Use features from a later layer or reduce the selected-head set."
+        )
 
 
 def _sync_module_grads(module: torch.nn.Module, world_size: int) -> None:
@@ -420,6 +446,17 @@ def train_cure(
             f"checkpoint_path={checkpoint_path or 'none'}",
             flush=True,
         )
+    if cure_params.sae_enabled:
+        if method != "cure_cpt":
+            raise ValueError("SAE steering is only supported for method=cure_cpt")
+        if not cure_params.freeze_base_model:
+            raise ValueError("SAE steering requires --freeze-base-model so only retrieval-head LoRA trains")
+        if not cure_params.sae_features_path:
+            raise ValueError("SAE steering requires --sae-features")
+        if offline_signal_dir is None:
+            raise ValueError("SAE steering requires --offline-signal-dir with precomputed feature targets")
+    if cure_params.lsor_enabled and method != "cure_cpt":
+        raise ValueError("LSOR is only supported for method=cure_cpt")
     gradient_checkpointing_enabled = (
         cure_params.gradient_checkpointing
         if gradient_checkpointing is None
@@ -477,8 +514,50 @@ def train_cure(
     if use_adapters and retrieval_heads:
         head_dim = int(model.config.hidden_size) // int(model.config.num_attention_heads)
         adapters = HeadAdapterSet(
-            retrieval_heads, head_dim, cure_params.lora_rank, cure_params.lora_alpha
+            retrieval_heads,
+            head_dim,
+            cure_params.lora_rank,
+            cure_params.lora_alpha,
+            hidden_size=int(model.config.hidden_size),
         ).to(device)
+    if cure_params.sae_enabled and adapters is None:
+        raise ValueError("SAE steering requires selected retrieval-head adapters")
+    if cure_params.lsor_enabled and adapters is None:
+        raise ValueError("LSOR requires selected retrieval-head adapters")
+
+    sae_model: SparseAutoencoder | None = None
+    sae_features: EvidenceFeatureSet | None = None
+    if cure_params.sae_enabled:
+        sae_features = load_evidence_feature_set(
+            str(cure_params.sae_features_path),
+            require_validated=cure_params.sae_require_validated_features,
+        )
+        _validate_sae_layer_covers_retrieval_heads(int(sae_features.layer), retrieval_heads)
+        sae_ckpt_path = cure_params.sae_checkpoint_path or sae_features.sae_checkpoint
+        if not sae_ckpt_path:
+            raise ValueError("SAE steering requires --sae-checkpoint or sae_checkpoint in feature JSON")
+        sae_model = load_sparse_autoencoder(sae_ckpt_path, device=device)
+        hidden_size = int(model.config.hidden_size)
+        if int(sae_model.encoder.in_features) != hidden_size:
+            raise ValueError(
+                f"SAE input_dim={sae_model.encoder.in_features} does not match model hidden_size={hidden_size}"
+            )
+        if _is_rank0(rank):
+            print(
+                json.dumps(
+                    {
+                        "event": "sae_steering_loaded",
+                        "layer": int(sae_features.layer),
+                        "hook_point": sae_features.hook_point,
+                        "num_features": len(sae_features.feature_ids),
+                        "validation_passed": bool(sae_features.validation_passed),
+                        "sae_checkpoint": str(sae_ckpt_path),
+                        "features": str(cure_params.sae_features_path),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     mask_format = attention_mask_format_for_model(model)
     if fsdp_active:
@@ -665,6 +744,13 @@ def train_cure(
 
         # Forward
         use_adapter_forward = adapters is not None and retrieval_heads
+        sae_capture_layers = {int(sae_features.layer)} if sae_features is not None else set()
+        lsor_capture_layers = (
+            {int(layer) for layer, _head in retrieval_heads}
+            if cure_params.lsor_enabled and cure_params.lambda_lsor > 0.0
+            else set()
+        )
+        resid_capture_layers = sae_capture_layers | lsor_capture_layers
         need_rh_bottleneck = (
             is_cure
             and use_adapter_forward
@@ -680,6 +766,8 @@ def train_cure(
             adapters, cure_params.local_window,
             compute_rh_bottleneck=need_rh_bottleneck,
             rh_bottleneck_scope=cure_params.rh_bottleneck_scope,
+            capture_resid_mid_layers=resid_capture_layers,
+            capture_adapter_write_layers=lsor_capture_layers,
         )
 
         # Loss & backward with gradient isolation
@@ -710,7 +798,8 @@ def train_cure(
             if cure_params.lambda_full_hu_ce > 0.0:
                 aux_losses["full_hu"] = l_full_hu
 
-            if cure_params.lambda_nonhu_logp > 0.0:
+            teacher_logits = None
+            if cure_params.lambda_nonhu_logp > 0.0 or cure_params.lambda_short_kl > 0.0:
                 with torch.no_grad():
                     teacher_out = model(input_ids, attention_mask=full_mask, use_cache=False)
                     teacher_logits = (
@@ -718,6 +807,8 @@ def train_cure(
                         if hasattr(teacher_out, "logits")
                         else teacher_out["logits"]
                     )
+            if cure_params.lambda_nonhu_logp > 0.0:
+                assert teacher_logits is not None
                 l_nonhu, nonhu_metrics = cure_nonhu_logp_consistency_loss(
                     out.logits_full,
                     teacher_logits,
@@ -733,6 +824,90 @@ def train_cure(
                     "loss/nonhu_logp_total": 0.0,
                     "utility/nonhu_count": 0.0,
                     "utility/nonhu_fraction": 0.0,
+                }
+
+            if cure_params.lambda_short_kl > 0.0:
+                assert teacher_logits is not None
+                l_short_kl, short_kl_metrics = short_kl_loss(
+                    out.logits_full,
+                    teacher_logits,
+                    high_utility,
+                    valid & loss_mask,
+                    cure_params.lambda_short_kl,
+                )
+                aux_losses["short_kl"] = l_short_kl
+            else:
+                short_kl_metrics = {
+                    "loss/short_kl": 0.0,
+                    "loss/short_kl_total": 0.0,
+                    "utility/short_kl_count": 0.0,
+                    "utility/short_kl_fraction": 0.0,
+                }
+
+            if sae_model is not None and sae_features is not None:
+                required = [
+                    "offline_sae_feature_full",
+                    "offline_sae_feature_neg",
+                    "offline_sae_feature_mask",
+                ]
+                missing = [key for key in required if key not in batch]
+                if missing:
+                    raise ValueError(
+                        "SAE steering requires offline feature targets in signal_dir: "
+                        + ", ".join(missing)
+                    )
+                sae_target_full = torch.as_tensor(batch["offline_sae_feature_full"], device=device)
+                sae_target_neg = torch.as_tensor(batch["offline_sae_feature_neg"], device=device)
+                sae_target_mask = torch.as_tensor(batch["offline_sae_feature_mask"], device=device)
+                sae_losses, sae_metrics = sae_feature_losses(
+                    out.resid_mid_by_layer or {},
+                    sae_model,
+                    sae_features,
+                    sae_target_full,
+                    sae_target_neg,
+                    sae_target_mask,
+                    valid & loss_mask,
+                    high_utility,
+                    beta_margin=cure_params.lambda_sae_margin,
+                    beta_match=cure_params.lambda_sae_match,
+                    gamma=cure_params.sae_margin_gamma,
+                    match_clip=cure_params.sae_match_clip,
+                )
+                aux_losses.update(sae_losses)
+            else:
+                sae_metrics = {
+                    "sae/enabled": 0.0,
+                    "loss/sae_margin_total": 0.0,
+                    "loss/sae_match_total": 0.0,
+                }
+
+            if cure_params.lsor_enabled and cure_params.lambda_lsor > 0.0:
+                if tokens_seen >= int(cure_params.lsor_warmup_tokens):
+                    l_lsor, lsor_metrics = lsor_loss(
+                        out.adapter_writes_by_layer or {},
+                        out.resid_mid_by_layer or {},
+                        input_doc_ids,
+                        high_utility & valid & loss_mask,
+                        top_k=cure_params.lsor_top_k,
+                        window=cure_params.lsor_window,
+                        max_context_tokens=cure_params.lsor_max_context_tokens,
+                        lambda_lsor=cure_params.lambda_lsor,
+                    )
+                    aux_losses["lsor"] = l_lsor
+                else:
+                    lsor_metrics = {
+                        "loss/lsor": 0.0,
+                        "loss/lsor_total": 0.0,
+                        "lsor/projection_ratio": 0.0,
+                        "lsor/active_layers": 0.0,
+                        "lsor/warmup_active": 1.0,
+                    }
+            else:
+                lsor_metrics = {
+                    "loss/lsor": 0.0,
+                    "loss/lsor_total": 0.0,
+                    "lsor/projection_ratio": 0.0,
+                    "lsor/active_layers": 0.0,
                 }
 
             if out.logits_rh_only is not None:
@@ -770,6 +945,9 @@ def train_cure(
                 **ce_metrics,
                 **full_hu_metrics,
                 **nonhu_metrics,
+                **short_kl_metrics,
+                **sae_metrics,
+                **lsor_metrics,
                 **rh_metrics,
                 **grad_metrics,
                 "loss/total": float((l_ce + aux_total).detach().item()),
@@ -941,8 +1119,22 @@ def train_cure(
         "lambda_cov": cure_params.lambda_cov,
         "lambda_full_hu_ce": cure_params.lambda_full_hu_ce,
         "lambda_nonhu_logp": cure_params.lambda_nonhu_logp,
+        "lambda_short_kl": cure_params.lambda_short_kl,
         "cure_main_loss_mask": cure_params.cure_main_loss_mask,
         "rh_bottleneck_scope": cure_params.rh_bottleneck_scope,
+        "sae_enabled": cure_params.sae_enabled,
+        "sae_checkpoint_path": cure_params.sae_checkpoint_path,
+        "sae_features_path": cure_params.sae_features_path,
+        "sae_require_validated_features": cure_params.sae_require_validated_features,
+        "lambda_sae_margin": cure_params.lambda_sae_margin,
+        "lambda_sae_match": cure_params.lambda_sae_match,
+        "sae_margin_gamma": cure_params.sae_margin_gamma,
+        "lsor_enabled": cure_params.lsor_enabled,
+        "lambda_lsor": cure_params.lambda_lsor,
+        "lsor_top_k": cure_params.lsor_top_k,
+        "lsor_window": cure_params.lsor_window,
+        "lsor_warmup_tokens": cure_params.lsor_warmup_tokens,
+        "lsor_max_context_tokens": cure_params.lsor_max_context_tokens,
         "adapter_lr": adapter_lr if adapter_params else None,
         "adapter_weight_decay": cure_params.adapter_weight_decay if adapter_params else None,
         "freeze_base_model": cure_params.freeze_base_model,
@@ -1030,11 +1222,26 @@ def main() -> None:
     parser.add_argument("--lambda-cov", type=float, default=0.005)
     parser.add_argument("--lambda-full-hu-ce", type=float, default=0.0)
     parser.add_argument("--lambda-nonhu-logp", type=float, default=0.0)
+    parser.add_argument("--lambda-short-kl", type=float, default=0.0)
     parser.add_argument(
         "--cure-main-loss-mask",
         choices=["all", "valid_remote", "high_utility", "none"],
         default="all",
     )
+    parser.add_argument("--sae-enable", action="store_true")
+    parser.add_argument("--sae-checkpoint", default=None)
+    parser.add_argument("--sae-features", default=None)
+    parser.add_argument("--allow-unvalidated-sae-features", action="store_true")
+    parser.add_argument("--lambda-sae-margin", type=float, default=0.02)
+    parser.add_argument("--lambda-sae-match", type=float, default=0.10)
+    parser.add_argument("--sae-margin-gamma", type=float, default=0.5)
+    parser.add_argument("--sae-match-clip", type=float, default=None)
+    parser.add_argument("--lsor-enable", action="store_true")
+    parser.add_argument("--lambda-lsor", type=float, default=0.0)
+    parser.add_argument("--lsor-top-k", type=int, default=16)
+    parser.add_argument("--lsor-window", type=int, default=128)
+    parser.add_argument("--lsor-warmup-tokens", type=int, default=10_000_000)
+    parser.add_argument("--lsor-max-context-tokens", type=int, default=4096)
     parser.add_argument("--utility-top-fraction-training", type=float, default=0.10)
     parser.add_argument("--rh-bottleneck-scope", choices=["all_layers", "routed_layers"], default="all_layers")
     parser.add_argument("--lora-rank", type=int, default=8)
@@ -1074,7 +1281,22 @@ def main() -> None:
         lambda_cov=args.lambda_cov,
         lambda_full_hu_ce=args.lambda_full_hu_ce,
         lambda_nonhu_logp=args.lambda_nonhu_logp,
+        lambda_short_kl=args.lambda_short_kl,
         cure_main_loss_mask=args.cure_main_loss_mask,
+        sae_enabled=args.sae_enable,
+        sae_checkpoint_path=args.sae_checkpoint,
+        sae_features_path=args.sae_features,
+        sae_require_validated_features=not args.allow_unvalidated_sae_features,
+        lambda_sae_margin=args.lambda_sae_margin,
+        lambda_sae_match=args.lambda_sae_match,
+        sae_margin_gamma=args.sae_margin_gamma,
+        sae_match_clip=args.sae_match_clip,
+        lsor_enabled=args.lsor_enable,
+        lambda_lsor=args.lambda_lsor,
+        lsor_top_k=args.lsor_top_k,
+        lsor_window=args.lsor_window,
+        lsor_warmup_tokens=args.lsor_warmup_tokens,
+        lsor_max_context_tokens=args.lsor_max_context_tokens,
         utility_top_fraction_training=args.utility_top_fraction_training,
         rh_bottleneck_scope=args.rh_bottleneck_scope,
         dtype=args.dtype,

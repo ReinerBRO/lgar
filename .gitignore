@@ -18,6 +18,7 @@ venv/
 data/
 runs/
 logs/
+outputs/
 reports/
 packages/
 tianyi_sync_test.txt

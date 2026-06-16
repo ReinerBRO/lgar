@@ -36,9 +36,29 @@ class CUREParams:
     lambda_cov: float = 0.005
     lambda_full_hu_ce: float = 0.0
     lambda_nonhu_logp: float = 0.0
+    lambda_short_kl: float = 0.0
     cure_main_loss_mask: str = "all"
     cov_warmup_tokens: int = 10_000_000
     rh_bottleneck_scope: str = "all_layers"
+
+    # CURE-v2 SAE evidence-feature steering. Defaults are off so CURE-v0 is
+    # behaviorally unchanged unless the caller provides validated features.
+    sae_enabled: bool = False
+    sae_checkpoint_path: str | None = None
+    sae_features_path: str | None = None
+    sae_require_validated_features: bool = True
+    lambda_sae_margin: float = 0.02
+    lambda_sae_match: float = 0.10
+    sae_margin_gamma: float = 0.5
+    sae_match_clip: float | None = None
+
+    # Optional Local Subspace Orthogonal Residual-write regularizer.
+    lsor_enabled: bool = False
+    lambda_lsor: float = 0.0
+    lsor_top_k: int = 16
+    lsor_window: int = 128
+    lsor_warmup_tokens: int = 10_000_000
+    lsor_max_context_tokens: int = 4096
 
     context_len: int = 4096
     tokens_per_run: int = 100_000_000

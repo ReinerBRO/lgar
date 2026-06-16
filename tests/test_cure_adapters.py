@@ -29,6 +29,16 @@ def test_head_adapter_set():
     assert adapter.num_parameters() > 0
 
 
+def test_o_side_adapter_can_write_hidden_size_residual():
+    adapter = HeadAdapterSet({(0, 1)}, head_dim=8, rank=2, hidden_size=32)
+    q = adapter.get_q_lora(0, 1)
+    o = adapter.get_o_lora(0, 1)
+    x = torch.randn(2, 3, 8)
+
+    assert q is not None and q(x).shape == (2, 3, 8)
+    assert o is not None and o(x).shape == (2, 3, 32)
+
+
 def test_adapter_params_only():
     heads = {(10, 2), (11, 5)}
     adapter = HeadAdapterSet(heads, head_dim=64, rank=4)

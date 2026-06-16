@@ -5,18 +5,27 @@ import torch.nn as nn
 
 
 class HeadSliceLoRA(nn.Module):
-    """LoRA adapter for a single Q head's slice of q_proj or o_proj.
+    """LoRA adapter for a single head slice.
 
-    Operates on head_dim slice, not full projection.
+    Operates on a head_dim input slice. By default it returns a head_dim slice
+    for q_proj. O-side CURE-SAE can set output_dim=hidden_size to write
+    directly into the residual stream instead of being limited by base W_O.
     Standard LoRA init: A is random and B is zero, so the adapter starts as a
     no-op but still has a live gradient path. Zero-initializing both A and B
     makes the bilinear adapter permanently dead.
     """
 
-    def __init__(self, head_dim: int, rank: int = 8, alpha: float = 16.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        rank: int = 8,
+        alpha: float = 16.0,
+        output_dim: int | None = None,
+    ) -> None:
         super().__init__()
+        out_dim = int(output_dim) if output_dim is not None else int(head_dim)
         self.lora_A = nn.Parameter(torch.empty(rank, head_dim))
-        self.lora_B = nn.Parameter(torch.zeros(head_dim, rank))
+        self.lora_B = nn.Parameter(torch.zeros(out_dim, rank))
         self.scaling = alpha / rank
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
 
@@ -31,7 +40,7 @@ class HeadAdapterSet(nn.Module):
 
     Each retrieval head (layer_id, q_head_id) gets:
       - q_lora: HeadSliceLoRA for q_proj slice
-      - o_lora: HeadSliceLoRA for o_proj slice
+      - o_lora: HeadSliceLoRA from selected head output to hidden residual write
     """
 
     def __init__(
@@ -40,10 +49,12 @@ class HeadAdapterSet(nn.Module):
         head_dim: int,
         rank: int = 8,
         alpha: float = 16.0,
+        hidden_size: int | None = None,
     ) -> None:
         super().__init__()
         self.retrieval_heads = frozenset(retrieval_heads)
         self.head_dim = head_dim
+        self.hidden_size = int(hidden_size) if hidden_size is not None else int(head_dim)
         self.rank = rank
         self.alpha = alpha
 
@@ -53,7 +64,7 @@ class HeadAdapterSet(nn.Module):
         for layer_id, q_head_id in sorted(self.retrieval_heads):
             key = f"{layer_id}_{q_head_id}"
             self.q_loras[key] = HeadSliceLoRA(head_dim, rank, alpha)
-            self.o_loras[key] = HeadSliceLoRA(head_dim, rank, alpha)
+            self.o_loras[key] = HeadSliceLoRA(head_dim, rank, alpha, output_dim=self.hidden_size)
 
     def has_adapter(self, layer_id: int, q_head_id: int) -> bool:
         return (layer_id, q_head_id) in self.retrieval_heads

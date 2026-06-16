@@ -597,6 +597,48 @@ class PackedSequenceSignalDataset(PackedSequenceLayoutDataset):
         self.offline_valid = np.load(self.signal_dir / "offline_lsd_valid.npy", mmap_mode="r")
         offline_lsd_path = self.signal_dir / "offline_lsd.npy"
         self.offline_lsd = np.load(offline_lsd_path, mmap_mode="r") if offline_lsd_path.exists() else None
+        sae_sparse_meta_path = self.signal_dir / "offline_sae_sparse_meta.json"
+        self.offline_sae_sparse_meta = None
+        self.offline_sae_sparse_offsets = None
+        self.offline_sae_sparse_token_positions = None
+        self.offline_sae_sparse_full = None
+        self.offline_sae_sparse_neg = None
+        if sae_sparse_meta_path.exists():
+            self.offline_sae_sparse_meta = json.loads(sae_sparse_meta_path.read_text(encoding="utf-8"))
+            self.offline_sae_sparse_offsets = np.load(
+                self.signal_dir / "offline_sae_sparse_offsets.npy",
+                mmap_mode="r",
+            )
+            self.offline_sae_sparse_token_positions = np.load(
+                self.signal_dir / "offline_sae_sparse_token_positions.npy",
+                mmap_mode="r",
+            )
+            self.offline_sae_sparse_full = np.load(
+                self.signal_dir / "offline_sae_sparse_full.npy",
+                mmap_mode="r",
+            )
+            self.offline_sae_sparse_neg = np.load(
+                self.signal_dir / "offline_sae_sparse_neg.npy",
+                mmap_mode="r",
+            )
+        sae_full_path = self.signal_dir / "offline_sae_feature_full.npy"
+        sae_neg_path = self.signal_dir / "offline_sae_feature_neg.npy"
+        sae_mask_path = self.signal_dir / "offline_sae_feature_mask.npy"
+        self.offline_sae_feature_full = (
+            np.load(sae_full_path, mmap_mode="r")
+            if sae_sparse_meta_path.exists() is False and sae_full_path.exists()
+            else None
+        )
+        self.offline_sae_feature_neg = (
+            np.load(sae_neg_path, mmap_mode="r")
+            if sae_sparse_meta_path.exists() is False and sae_neg_path.exists()
+            else None
+        )
+        self.offline_sae_feature_mask = (
+            np.load(sae_mask_path, mmap_mode="r")
+            if sae_sparse_meta_path.exists() is False and sae_mask_path.exists()
+            else None
+        )
 
     def sample(self, batch_size: int) -> dict[str, np.ndarray]:
         batch = super().sample(batch_size)
@@ -605,6 +647,48 @@ class PackedSequenceSignalDataset(PackedSequenceLayoutDataset):
         batch["offline_lsd_valid"] = np.asarray(self.offline_valid[indices], dtype=bool)
         if self.offline_lsd is not None:
             batch["offline_lsd"] = np.asarray(self.offline_lsd[indices], dtype=np.float32)
+        if self.offline_sae_sparse_meta is not None:
+            num_features = int(self.offline_sae_sparse_meta["num_features"])
+            full = np.zeros((indices.shape[0], self.seq_len, num_features), dtype=np.float32)
+            neg = np.zeros_like(full)
+            mask = np.zeros((indices.shape[0], self.seq_len), dtype=bool)
+            assert self.offline_sae_sparse_offsets is not None
+            assert self.offline_sae_sparse_token_positions is not None
+            assert self.offline_sae_sparse_full is not None
+            assert self.offline_sae_sparse_neg is not None
+            for row, seq_idx in enumerate(indices.tolist()):
+                offset_start = int(self.offline_sae_sparse_offsets[int(seq_idx)])
+                offset_end = int(self.offline_sae_sparse_offsets[int(seq_idx) + 1])
+                if offset_end <= offset_start:
+                    continue
+                positions = np.asarray(
+                    self.offline_sae_sparse_token_positions[offset_start:offset_end],
+                    dtype=np.int64,
+                )
+                full[row, positions] = np.asarray(
+                    self.offline_sae_sparse_full[offset_start:offset_end],
+                    dtype=np.float32,
+                )
+                neg[row, positions] = np.asarray(
+                    self.offline_sae_sparse_neg[offset_start:offset_end],
+                    dtype=np.float32,
+                )
+                mask[row, positions] = True
+            batch["offline_sae_feature_full"] = full
+            batch["offline_sae_feature_neg"] = neg
+            batch["offline_sae_feature_mask"] = mask
+        if self.offline_sae_feature_full is not None:
+            batch["offline_sae_feature_full"] = np.asarray(
+                self.offline_sae_feature_full[indices], dtype=np.float32
+            )
+        if self.offline_sae_feature_neg is not None:
+            batch["offline_sae_feature_neg"] = np.asarray(
+                self.offline_sae_feature_neg[indices], dtype=np.float32
+            )
+        if self.offline_sae_feature_mask is not None:
+            batch["offline_sae_feature_mask"] = np.asarray(
+                self.offline_sae_feature_mask[indices], dtype=bool
+            )
         return batch
 
 

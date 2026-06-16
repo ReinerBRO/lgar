@@ -14,6 +14,8 @@ class CUREForwardOutput:
     logits_full: torch.Tensor
     logits_rh_only: torch.Tensor | None
     metrics: dict[str, float]
+    resid_mid_by_layer: dict[int, torch.Tensor] | None = None
+    adapter_writes_by_layer: dict[int, torch.Tensor] | None = None
 
 
 def _unwrap_parallel_module(module: nn.Module) -> nn.Module:
@@ -43,12 +45,16 @@ def _model_backbone(model: nn.Module) -> nn.Module:
 def _register_adapter_hooks(
     model: nn.Module,
     adapters: HeadAdapterSet,
+    adapter_write_layers: set[int] | None = None,
+    adapter_writes_by_layer: dict[int, torch.Tensor] | None = None,
+    phase_ref: dict[str, str] | None = None,
 ) -> list[torch.utils.hooks.RemovableHandle]:
     """Register hooks on q_proj and o_proj for each retrieval head.
 
     For each retrieval head (layer_id, q_head_id):
     - q_proj post-hook: adds LoRA delta to the target Q head's slice
-    - o_proj pre-hook: adds LoRA delta to the target head's slice of o_proj input
+    - o_proj post-hook: adds hidden-size LoRA residual write from the target
+      head's attention output slice
 
     Returns list of handles for cleanup.
     """
@@ -83,21 +89,75 @@ def _register_adapter_hooks(
 
         handles.append(q_proj.register_forward_hook(q_hook_fn))
 
-        # O hook: pre-hook on o_proj to add LoRA to target head's slice
+        # O hook: post-hook on o_proj to add a direct residual write. This is
+        # intentionally not routed through base W_O; SAE-CURE needs O-side
+        # adapters to be able to write evidence features in hidden space.
         # o_proj input: [B, T, hidden_size]
-        # register_forward_pre_hook with_kwargs: (module, args, kwargs)
-        def o_hook_fn(module, args, kwargs, *, _o=o_lora, _n=n_heads, _d=head_dim, _t=q_head_id):
+        # o_proj output: [B, T, hidden_size]
+        def o_hook_fn(
+            module,
+            args,
+            kwargs,
+            output,
+            *,
+            _o=o_lora,
+            _n=n_heads,
+            _d=head_dim,
+            _t=q_head_id,
+            _layer=layer_id,
+        ):
             x = args[0]  # [B, T, hidden_size]
             shape = x.shape
             x_r = x.reshape(shape[0], shape[1], _n, _d)
-            lora_delta = _o(x_r[:, :, _t])  # [B, T, head_dim]
-            head_mask = torch.zeros(_n, device=x.device, dtype=x.dtype)
-            head_mask[_t] = 1.0
-            full_delta = lora_delta[:, :, None, :] * head_mask[None, None, :, None]
-            return ((x_r + full_delta).reshape(shape),) + args[1:], kwargs
+            residual_delta = _o(x_r[:, :, _t]).to(output.dtype)  # [B, T, hidden_size]
+            if residual_delta.shape != output.shape:
+                raise RuntimeError(
+                    f"O-side residual adapter must return shape {tuple(output.shape)}, "
+                    f"got {tuple(residual_delta.shape)}"
+                )
+            if (
+                adapter_writes_by_layer is not None
+                and adapter_write_layers is not None
+                and _layer in adapter_write_layers
+                and (phase_ref is None or phase_ref.get("name") == "full")
+            ):
+                previous = adapter_writes_by_layer.get(_layer)
+                adapter_writes_by_layer[_layer] = residual_delta if previous is None else previous + residual_delta
+            return output + residual_delta
 
-        handles.append(o_proj.register_forward_pre_hook(o_hook_fn, with_kwargs=True))
+        handles.append(o_proj.register_forward_hook(o_hook_fn, with_kwargs=True))
 
+    return handles
+
+
+def _register_resid_mid_capture_hooks(
+    model: nn.Module,
+    layers: set[int],
+    resid_mid_by_layer: dict[int, torch.Tensor],
+    phase_ref: dict[str, str] | None = None,
+) -> list[torch.utils.hooks.RemovableHandle]:
+    """Capture resid_mid: post-attention residual before MLP."""
+    if not layers:
+        return []
+    backbone = _model_backbone(model)
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+    for layer_idx, decoder_layer in enumerate(backbone.layers):
+        if layer_idx not in layers:
+            continue
+        decoder_layer = _unwrap_parallel_module(decoder_layer)
+        hook_point = getattr(decoder_layer, "post_attention_layernorm", None)
+        if hook_point is None:
+            raise AttributeError(
+                f"Layer {layer_idx} has no post_attention_layernorm; "
+                "cannot capture required SAE resid_mid hook point"
+            )
+
+        def hook_fn(module, args, kwargs, *, _layer=layer_idx):
+            if phase_ref is None or phase_ref.get("name") == "full":
+                resid_mid_by_layer[_layer] = args[0]
+            return args, kwargs
+
+        handles.append(hook_point.register_forward_pre_hook(hook_fn, with_kwargs=True))
     return handles
 
 
@@ -299,6 +359,8 @@ def cure_forward(
     local_window: int,
     compute_rh_bottleneck: bool = True,
     rh_bottleneck_scope: str = "all_layers",
+    capture_resid_mid_layers: set[int] | None = None,
+    capture_adapter_write_layers: set[int] | None = None,
 ) -> CUREForwardOutput:
     """Run CURE dual-path forward.
 
@@ -309,10 +371,27 @@ def cure_forward(
     2. RH-bottleneck: adapters active, retrieval heads full / non-retrieval heads local
     """
     adapter_handles: list[torch.utils.hooks.RemovableHandle] = []
+    resid_handles: list[torch.utils.hooks.RemovableHandle] = []
+    resid_mid_by_layer: dict[int, torch.Tensor] = {}
+    adapter_writes_by_layer: dict[int, torch.Tensor] = {}
+    phase_ref = {"name": "full"}
 
     # Register adapter hooks for both passes
     if adapters is not None and retrieval_heads:
-        adapter_handles = _register_adapter_hooks(model, adapters)
+        adapter_handles = _register_adapter_hooks(
+            model,
+            adapters,
+            adapter_write_layers=capture_adapter_write_layers,
+            adapter_writes_by_layer=adapter_writes_by_layer,
+            phase_ref=phase_ref,
+        )
+    if capture_resid_mid_layers:
+        resid_handles = _register_resid_mid_capture_hooks(
+            model,
+            set(capture_resid_mid_layers),
+            resid_mid_by_layer,
+            phase_ref=phase_ref,
+        )
 
     try:
         # Forward 1: full (with adapters active)
@@ -325,6 +404,7 @@ def cure_forward(
 
         logits_rh_only = None
         if compute_rh_bottleneck and retrieval_heads:
+            phase_ref["name"] = "rh"
             mask_handles = _register_rh_bottleneck_mask_hooks(
                 model, doc_ids, retrieval_heads, local_window, scope=rh_bottleneck_scope
             )
@@ -339,6 +419,8 @@ def cure_forward(
     finally:
         for h in adapter_handles:
             h.remove()
+        for h in resid_handles:
+            h.remove()
 
     metrics = {
         "forward/retrieval_heads": float(len(retrieval_heads)),
@@ -348,4 +430,6 @@ def cure_forward(
         logits_full=logits_full,
         logits_rh_only=logits_rh_only,
         metrics=metrics,
+        resid_mid_by_layer=resid_mid_by_layer if capture_resid_mid_layers else None,
+        adapter_writes_by_layer=adapter_writes_by_layer if capture_adapter_write_layers else None,
     )

@@ -64,6 +64,7 @@ def load_adapters_from_checkpoint(
         head_dim=head_dim,
         rank=infer_lora_rank(adapter_state, lora_rank),
         alpha=infer_lora_alpha(checkpoint, lora_alpha),
+        hidden_size=int(model.config.hidden_size),
     )
     adapters.load_state_dict(adapter_state, strict=True)
     adapters.to(device)
