@@ -8,6 +8,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -49,15 +50,17 @@ def _register_feature_intervention_hook(
     token_mask: torch.Tensor,
     mode: str,
     target_acts: torch.Tensor | None = None,
-) -> torch.utils.hooks.RemovableHandle:
+) -> list[torch.utils.hooks.RemovableHandle]:
     from lgar_cpt.modeling import qwen_layers
 
-    hook_point = getattr(qwen_layers(model)[int(layer)], "post_attention_layernorm", None)
+    decoder_layer = qwen_layers(model)[int(layer)]
+    hook_point = getattr(decoder_layer, "post_attention_layernorm", None)
     if hook_point is None:
         raise AttributeError(
             f"Layer {layer} has no post_attention_layernorm; cannot validate resid_mid features"
         )
     token_mask = token_mask.bool()
+    state: dict[str, torch.Tensor] = {}
 
     def hook_fn(module, args, kwargs):
         residual = args[0]
@@ -77,9 +80,24 @@ def _register_feature_intervention_hook(
         else:
             raise ValueError(f"unknown feature intervention mode={mode!r}")
         updated = updated.to(dtype=residual.dtype)
+        state["delta"] = (residual - updated).detach()
         return (updated,) + args[1:], kwargs
 
-    return hook_point.register_forward_pre_hook(hook_fn, with_kwargs=True)
+    def layer_output_hook(module, args, kwargs, output):
+        delta = state.pop("delta", None)
+        if delta is None:
+            return output
+        if torch.is_tensor(output):
+            return output - delta.to(device=output.device, dtype=output.dtype)
+        if isinstance(output, tuple) and output and torch.is_tensor(output[0]):
+            first = output[0] - delta.to(device=output[0].device, dtype=output[0].dtype)
+            return (first, *output[1:])
+        raise TypeError(f"unsupported decoder layer output type for SAE intervention: {type(output)!r}")
+
+    return [
+        hook_point.register_forward_pre_hook(hook_fn, with_kwargs=True),
+        decoder_layer.register_forward_hook(layer_output_hook, with_kwargs=True),
+    ]
 
 
 @torch.no_grad()
@@ -91,7 +109,6 @@ def _logp_for_mask(
     token_mask: torch.Tensor,
     extra_handles: list[torch.utils.hooks.RemovableHandle] | None = None,
 ) -> torch.Tensor:
-    from lgar_cpt.mining import gather_logprob
     from lgar_cpt.modeling import unwrap_logits
 
     try:
@@ -99,8 +116,15 @@ def _logp_for_mask(
     finally:
         for handle in extra_handles or []:
             handle.remove()
-    logp = gather_logprob(logits, labels)
-    return logp[token_mask.bool()].detach().float()
+    mask = token_mask.bool()
+    selected_logits = logits[mask].float()
+    selected_labels = labels[mask]
+    if selected_logits.numel() == 0:
+        return selected_logits.new_empty((0,), dtype=torch.float32)
+    return F.log_softmax(selected_logits, dim=-1).gather(
+        -1,
+        selected_labels.unsqueeze(-1),
+    ).squeeze(-1).detach().float()
 
 
 def _mean_or_zero(values: list[torch.Tensor]) -> float:
@@ -137,6 +161,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-sequences", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--sequence-rank", type=int, default=0)
+    parser.add_argument("--sequence-world-size", type=int, default=1)
     parser.add_argument("--local-window", type=int, default=1024)
     parser.add_argument("--min-ablation-margin", type=float, default=0.01)
     parser.add_argument("--min-feature-ablation-logp-drop", type=float, default=0.01)
@@ -197,6 +223,13 @@ def main() -> None:
         seed=int(args.seed),
     )
     num_sequences = min(dataset.num_sequences, int(args.max_sequences))
+    sequence_world_size = max(1, int(args.sequence_world_size))
+    sequence_rank = int(args.sequence_rank)
+    if sequence_rank < 0 or sequence_rank >= sequence_world_size:
+        raise ValueError(
+            f"--sequence-rank must be in [0, {sequence_world_size}); got {sequence_rank}"
+        )
+    sequence_indices = np.arange(num_sequences, dtype=np.int64)[sequence_rank::sequence_world_size]
     mask_format = attention_mask_format_for_model(model)
 
     selected_ablation_drops: list[torch.Tensor] = []
@@ -206,11 +239,15 @@ def main() -> None:
     masked_head_drops: list[torch.Tensor] = []
     token_total = 0
 
-    for start in range(0, num_sequences, int(args.batch_size)):
+    for offset in range(0, int(sequence_indices.shape[0]), int(args.batch_size)):
         if token_total >= int(args.max_tokens):
             break
-        end = min(start + int(args.batch_size), num_sequences)
-        indices = np.arange(start, end, dtype=np.int64)
+        batch_indices = sequence_indices[offset : offset + int(args.batch_size)]
+        if batch_indices.size == 0:
+            continue
+        start = int(batch_indices[0])
+        end = int(batch_indices[-1]) + 1
+        indices = batch_indices.astype(np.int64, copy=False)
         batch = _materialize_indices(dataset, indices)
         input_ids = torch.as_tensor(batch["input_ids"], device=device)
         labels = torch.as_tensor(batch["labels"], device=device)
@@ -241,7 +278,7 @@ def main() -> None:
 
         full_logp = _logp_for_mask(model, input_ids, labels, full_mask, token_mask)
 
-        ablate_handle = _register_feature_intervention_hook(
+        ablate_handles = _register_feature_intervention_hook(
             model,
             int(features.layer),
             sae,
@@ -255,11 +292,11 @@ def main() -> None:
             labels,
             full_mask,
             token_mask,
-            extra_handles=[ablate_handle],
+            extra_handles=ablate_handles,
         )
         selected_ablation_drops.append(full_logp - full_ablated_logp)
 
-        random_handle = _register_feature_intervention_hook(
+        random_handles = _register_feature_intervention_hook(
             model,
             int(features.layer),
             sae,
@@ -273,7 +310,7 @@ def main() -> None:
             labels,
             full_mask,
             token_mask,
-            extra_handles=[random_handle],
+            extra_handles=random_handles,
         )
         random_ablation_drops.append(full_logp - random_ablated_logp)
 
@@ -286,7 +323,7 @@ def main() -> None:
             full_mask,
         )
         short_logp = _logp_for_mask(model, input_ids, labels, short_mask, token_mask)
-        patch_handle = _register_feature_intervention_hook(
+        patch_handles = _register_feature_intervention_hook(
             model,
             int(features.layer),
             sae,
@@ -301,7 +338,7 @@ def main() -> None:
             labels,
             short_mask,
             token_mask,
-            extra_handles=[patch_handle],
+            extra_handles=patch_handles,
         )
         short_patch_gains.append(patched_short_logp - short_logp)
 
@@ -347,6 +384,8 @@ def main() -> None:
                     "start": int(start),
                     "end": int(end),
                     "tokens": int(token_total),
+                    "sequence_rank": int(sequence_rank),
+                    "sequence_world_size": int(sequence_world_size),
                 },
                 sort_keys=True,
             ),
@@ -373,6 +412,8 @@ def main() -> None:
         "feature_ids": list(features.feature_ids),
         "random_feature_ids": list(random_ids),
         "num_tokens": int(token_total),
+        "sequence_rank": int(sequence_rank),
+        "sequence_world_size": int(sequence_world_size),
         "selected_ablation_delta_logp": selected_drop,
         "random_ablation_delta_logp": random_drop,
         "masked_head_answer_delta_logp": masked_head_answer_drop,
